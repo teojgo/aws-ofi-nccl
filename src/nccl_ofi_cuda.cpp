@@ -14,12 +14,24 @@
 #include "nccl_ofi_log.h"
 #include "nccl_ofi_param.h"
 
+#if CUDA_VERSION >= 13000
+	#define PFN_cuCtxGetCurrent PFN_cuCtxGetCurrent_v4000
+	#define PFN_cuCtxGetDevice_v2 PFN_cuCtxGetDevice_v13000
+	#define PFN_cuDeviceGetAttribute PFN_cuDeviceGetAttribute_v2000
+	#define PFN_cuMemGetHandleForAddressRange PFN_cuMemGetHandleForAddressRange_v11070
+	#define PFN_cuMemGetAddressRange PFN_cuMemGetAddressRange_v3020
+	#define PFN_cuMemAlloc PFN_cuMemAlloc_v3020
+	#define PFN_cuMemFree PFN_cuMemFree_v3020
+	#define PFN_cuMemcpy PFN_cuMemcpy_v4000
+#endif
+
 #define DECLARE_CUDA_FUNCTION(function) static PFN_##function pfn_##function = NULL
 #define RESOLVE_CUDA_FUNCTION(function)                                                                                 \
 	do {                                                                                                            \
 		enum cudaDriverEntryPointQueryResult result;                                                            \
 		cudaError_t err =                                                                                       \
-			cudaGetDriverEntryPoint(#function, (void **)&pfn_##function, cudaEnableDefault, &result);       \
+			cudaGetDriverEntryPointByVersion(#function, (void **)&pfn_##function, CUDA_VERSION,             \
+							 cudaEnableDefault, &result);                                   \
 		if (err != cudaSuccess) {                                                                               \
 			switch (result) {                                                                               \
 			case cudaDriverEntryPointSymbolNotFound:                                                        \
@@ -36,7 +48,16 @@
 		}                                                                                                       \
 	} while (0);
 
-DECLARE_CUDA_FUNCTION(cuCtxGetDevice);
+// In CUDA 13 cudaGetDriverEntryPoint("cuCtxGetDevice", ....) returns
+// a pointer to cuCtxGetDevice_v2, which has a different signature
+// from cuCtxGetDevice, requiring a context, not only a device
+#if CUDA_VERSION >= 13000
+	DECLARE_CUDA_FUNCTION(cuCtxGetDevice_v2);
+	DECLARE_CUDA_FUNCTION(cuCtxGetCurrent);
+#else
+	DECLARE_CUDA_FUNCTION(cuCtxGetDevice);
+#endif
+
 DECLARE_CUDA_FUNCTION(cuDeviceGetAttribute);
 DECLARE_CUDA_FUNCTION(cuMemGetHandleForAddressRange);
 DECLARE_CUDA_FUNCTION(cuMemGetAddressRange);
@@ -70,7 +91,13 @@ int nccl_net_ofi_cuda_init(void)
 	              driverVersion,
 	              runtimeVersion);
 
-	RESOLVE_CUDA_FUNCTION(cuCtxGetDevice);
+	#if CUDA_VERSION >= 13000
+		RESOLVE_CUDA_FUNCTION(cuCtxGetDevice_v2);
+		RESOLVE_CUDA_FUNCTION(cuCtxGetCurrent);
+	#else
+		RESOLVE_CUDA_FUNCTION(cuCtxGetDevice);
+	#endif
+
 	RESOLVE_CUDA_FUNCTION(cuDeviceGetAttribute);
 	RESOLVE_CUDA_FUNCTION(cuMemGetHandleForAddressRange);
 	RESOLVE_CUDA_FUNCTION(cuMemGetAddressRange);
@@ -109,6 +136,7 @@ int nccl_net_ofi_cuda_get_num_devices(void)
 }
 
 int nccl_net_ofi_cuda_get_active_device_idx(void)
+
 {
 	int index = -1;
 	cudaError_t res = cudaGetDevice(&index);
@@ -129,7 +157,7 @@ int nccl_net_ofi_cuda_mem_alloc(void **ptr, size_t size)
 
 int nccl_net_ofi_cuda_mem_free(void *ptr)
 {
-       CUresult ret = pfn_cuMemFree((CUdeviceptr)ptr);
+	CUresult ret = pfn_cuMemFree((CUdeviceptr)ptr);
 	return ret == CUDA_SUCCESS ? 0 : -EINVAL;
 }
 
@@ -207,16 +235,39 @@ int nccl_net_ofi_get_cuda_device_for_addr(void *data, int *dev_id)
 
 bool nccl_net_ofi_cuda_have_gdr_support_attr(void)
 {
-#if HAVE_CUDA_GDRFLUSH_SUPPORT
-	if (pfn_cuCtxGetDevice == NULL || pfn_cuDeviceGetAttribute == NULL) {
-		return false;
-	}
 
-	CUdevice dev;
-	CUresult result = pfn_cuCtxGetDevice(&dev);
-	if (result != CUDA_SUCCESS) {
-		return false;
-	}
+#if HAVE_CUDA_GDRFLUSH_SUPPORT
+        #if CUDA_VERSION >= 13000
+		if (pfn_cuCtxGetCurrent == NULL ) {
+			return false;
+		}
+
+		CUcontext ctx;
+		CUresult result = pfn_cuCtxGetCurrent(&ctx);
+		if (result != CUDA_SUCCESS) {
+			return false;
+		}
+		
+		if (pfn_cuCtxGetDevice_v2 == NULL || pfn_cuDeviceGetAttribute == NULL) {
+			return false;
+		}
+		
+		CUdevice dev;
+		result = pfn_cuCtxGetDevice_v2(&dev, ctx);
+		if (result != CUDA_SUCCESS) {
+			return false;
+		}
+        #else
+		if (pfn_cuCtxGetDevice == NULL || pfn_cuDeviceGetAttribute == NULL) {
+			return false;
+		}
+		
+		CUdevice dev;
+		CUresult result = pfn_cuCtxGetDevice(&dev);
+		if (result != CUDA_SUCCESS) {
+			return false;
+		}
+	#endif
 
 	int supported;
 	result = pfn_cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, dev);
@@ -234,16 +285,40 @@ bool nccl_net_ofi_cuda_have_gdr_support_attr(void)
 bool nccl_net_ofi_cuda_have_dma_buf_attr(void)
 {
 #if HAVE_CUDA_DMABUF_SUPPORT
-	static_assert(CUDA_VERSION >= 11070, "Requires cudart>=11.7");
-	if (pfn_cuCtxGetDevice == NULL || pfn_cuDeviceGetAttribute == NULL) {
-		return false;
-	}
 
-	CUdevice dev;
-	CUresult result = pfn_cuCtxGetDevice(&dev);
-	if (result != CUDA_SUCCESS) {
-		return false;
-	}
+	static_assert(CUDA_VERSION >= 11070, "Requires cudart>=11.7");
+
+        #if CUDA_VERSION >= 13000
+		if (pfn_cuCtxGetDevice_v2 == NULL || pfn_cuDeviceGetAttribute == NULL) {
+			return false;
+		}
+
+        	if (pfn_cuCtxGetCurrent == NULL ) {
+			return false;
+		}
+
+        	CUcontext ctx;
+        	CUresult result = pfn_cuCtxGetCurrent(&ctx);
+        	if (result != CUDA_SUCCESS) {
+			return false;
+		}
+
+		CUdevice dev;
+		result = pfn_cuCtxGetDevice_v2(&dev, ctx);
+		if (result != CUDA_SUCCESS) {
+			return false;
+		}
+        #else
+        	if (pfn_cuCtxGetDevice == NULL || pfn_cuDeviceGetAttribute == NULL) {
+			return false;
+		}
+
+		CUdevice dev;
+		CUresult result = pfn_cuCtxGetDevice(&dev);
+		if (result != CUDA_SUCCESS) {
+			return false;
+		}
+        #endif
 
 	int supported;
 	result = pfn_cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev);
